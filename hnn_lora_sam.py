@@ -1,17 +1,14 @@
-# ================== INSTALL & IMPORTS ==================
-# !pip install optax
 
+# ================== IMPORTS ==================
 import jax
 import jax.numpy as jnp
 from jax import random, grad, value_and_grad, jit, lax
 import optax
-from typing import Callable, Dict
+from typing import Dict
 
 tree_map = jax.tree_util.tree_map
 
-# ======================================================
-#  HAMILTONIAN PHYSICS ENGINE (GROUND TRUTH)
-# ======================================================
+# ================== PHYSICS: TRUE HAMILTONIAN ==================
 
 ALPHA = 1.0
 BETA = 0.2
@@ -28,7 +25,7 @@ def hamiltonian_dynamics(x, dt=DT):
     p_next = p + dt * dpdt
     return jnp.stack([q_next, p_next], axis=-1)
 
-def rollout_hamiltonian(key, n_trajectories=64, T=128, dt=DT):
+def rollout_hamiltonian(key, n_trajectories=128, T=128, dt=DT):
     k_init, = random.split(key, 1)
     x0 = random.uniform(k_init, (n_trajectories, 2), minval=-2.0, maxval=2.0)
 
@@ -42,47 +39,71 @@ def rollout_hamiltonian(key, n_trajectories=64, T=128, dt=DT):
     xs_next = xs_next.reshape(T * n_trajectories, 2)
     return xs, xs_next
 
-# ================== HNN MODEL (LoRA + MLP) ==================
+# ================== HNN MODEL (LoRA ON MULTIPLE LAYERS) ==================
 
 def init_hnn_params(key, in_dim, hidden_dim, lora_rank, scale=0.02):
-    k_base, k_loraA, k_loraB, k_hid, k_out = random.split(key, 5)
-    base_W = random.normal(k_base, (in_dim, hidden_dim)) * (1.0 / jnp.sqrt(in_dim))
-    lora_A = random.normal(k_loraA, (in_dim, lora_rank)) * scale
-    lora_B = jnp.zeros((lora_rank, hidden_dim))
-    W_hid = random.normal(k_hid, (hidden_dim, hidden_dim)) * (1.0 / jnp.sqrt(hidden_dim))
+    k_in_base, k_in_A, k_in_B, k_hid_base, k_hid_A, k_hid_B, k_out_base, k_out_A, k_out_B, k_bhid, k_bout = random.split(key, 11)
+
+    base_W_in = random.normal(k_in_base, (in_dim, hidden_dim)) * (1.0 / jnp.sqrt(in_dim))
+    lora_A_in = random.normal(k_in_A, (in_dim, lora_rank)) * scale
+    lora_B_in = jnp.zeros((lora_rank, hidden_dim))
+
+    base_W_hid = random.normal(k_hid_base, (hidden_dim, hidden_dim)) * (1.0 / jnp.sqrt(hidden_dim))
+    lora_A_hid = random.normal(k_hid_A, (hidden_dim, lora_rank)) * scale
+    lora_B_hid = jnp.zeros((lora_rank, hidden_dim))
+
+    base_W_out = random.normal(k_out_base, (hidden_dim, 1)) * (1.0 / jnp.sqrt(hidden_dim))
+    lora_A_out = random.normal(k_out_A, (hidden_dim, lora_rank)) * scale
+    lora_B_out = jnp.zeros((lora_rank, 1))
+
     b_hid = jnp.zeros((hidden_dim,))
-    W_out = random.normal(k_out, (hidden_dim, 1)) * (1.0 / jnp.sqrt(hidden_dim))
     b_out = jnp.zeros((1,))
+
     return {
-        "base_W": base_W,
-        "lora_A": lora_A,
-        "lora_B": lora_B,
-        "W_hid": W_hid,
+        "base_W_in": base_W_in,
+        "lora_A_in": lora_A_in,
+        "lora_B_in": lora_B_in,
+        "base_W_hid": base_W_hid,
+        "lora_A_hid": lora_A_hid,
+        "lora_B_hid": lora_B_hid,
+        "base_W_out": base_W_out,
+        "lora_A_out": lora_A_out,
+        "lora_B_out": lora_B_out,
         "b_hid": b_hid,
-        "W_out": W_out,
         "b_out": b_out,
     }
 
+def apply_lora_linear(x, base_W, A, B, alpha=1.0):
+    r = A.shape[1]
+    base = x @ base_W
+    lora = x @ A @ B
+    return base + (alpha / r) * lora
+
 def hnn_forward(params, x, alpha=1.0):
-    base = x @ params["base_W"]
-    lora = x @ params["lora_A"] @ params["lora_B"]
-    r = params["lora_A"].shape[1]
-    h = base + (alpha / r) * lora
+    h = apply_lora_linear(x, params["base_W_in"], params["lora_A_in"], params["lora_B_in"], alpha=alpha)
     h = jax.nn.tanh(h)
-    h = jax.nn.tanh(h @ params["W_hid"] + params["b_hid"])
-    H = (h @ params["W_out"] + params["b_out"]).squeeze(-1)
-    return H
+    h = apply_lora_linear(h, params["base_W_hid"], params["lora_A_hid"], params["lora_B_hid"], alpha=alpha)
+    h = jax.nn.tanh(h + params["b_hid"])
+    H = apply_lora_linear(h, params["base_W_out"], params["lora_A_out"], params["lora_B_out"], alpha=alpha)
+    H = H + params["b_out"]
+    return H.squeeze(-1)
+
+# --------- HNN STEP WITH SYMPLECTIC EULER ---------
 
 def hnn_step(params, x, dt=DT):
     def H_fn(x_single):
         return hnn_forward(params, x_single[None, :])[0]
+
     dHdx = jax.vmap(grad(H_fn))(x)
     dHdq = dHdx[:, 0]
     dHdp = dHdx[:, 1]
-    dqdt = dHdp
-    dpdt = -dHdq
-    q_next = x[:, 0] + dt * dqdt
-    p_next = x[:, 1] + dt * dpdt
+
+    q = x[:, 0]
+    p = x[:, 1]
+
+    p_next = p - dt * dHdq
+    q_next = q + dt * dHdp
+
     return jnp.stack([q_next, p_next], axis=-1)
 
 # ================== LOSS: 1-STEP + LONG ROLLOUT ==================
@@ -140,7 +161,7 @@ def compute_total_loss(params, batch, long_rollout_cfg, key):
 
     return total, (mse_1, long_mse)
 
-# ================== HVP & LANCZOS ==================
+# ================== HVP & LANCZOS (CURVATURE) ==================
 
 def pytree_norm(tree):
     return jnp.sqrt(sum([jnp.sum(x**2) for x in jax.tree_util.tree_leaves(tree)]))
@@ -151,7 +172,7 @@ def pytree_scale(tree, scalar):
 def pytree_sub(a, b):
     return tree_map(lambda x, y: x - y, a, b)
 
-def hvp(loss_fn: Callable, params, batch, vec_params, long_rollout_cfg, key):
+def hvp(loss_fn, params, batch, vec_params, long_rollout_cfg, key):
     def loss_wrapped(p):
         total, _ = loss_fn(p, batch, long_rollout_cfg, key)
         return total
@@ -217,23 +238,31 @@ def curvature_signal(params, batch, key, long_rollout_cfg):
 
 def make_lora_mask(params: Dict[str, jnp.ndarray]):
     return {
-        "base_W": False,
-        "lora_A": True,
-        "lora_B": True,
-        "W_hid": False,
+        "base_W_in": False,
+        "lora_A_in": True,
+        "lora_B_in": True,
+        "base_W_hid": False,
+        "lora_A_hid": True,
+        "lora_B_hid": True,
+        "base_W_out": False,
+        "lora_A_out": True,
+        "lora_B_out": True,
         "b_hid": False,
-        "W_out": False,
         "b_out": False,
     }
 
 def make_train_mask(params: Dict[str, jnp.ndarray]):
     return {
-        "base_W": False,
-        "lora_A": True,
-        "lora_B": True,
-        "W_hid": True,
+        "base_W_in": True,
+        "lora_A_in": True,
+        "lora_B_in": True,
+        "base_W_hid": True,
+        "lora_A_hid": True,
+        "lora_B_hid": True,
+        "base_W_out": True,
+        "lora_A_out": True,
+        "lora_B_out": True,
         "b_hid": True,
-        "W_out": True,
         "b_out": True,
     }
 
@@ -247,7 +276,7 @@ def masked_update(grads, params, optimizer, opt_state):
     new_params = optax.apply_updates(params, updates)
     return new_params, new_opt_state
 
-# ================== SAM (LORA-ONLY PERTURB) + DYNAMIC ρ ==================
+# ================== SAM + DYNAMIC ρ ==================
 
 def sam_step(params, opt_state, batch, optimizer, rho, long_rollout_cfg, key):
     lora_mask = make_lora_mask(params)
@@ -294,13 +323,13 @@ def make_train_step_standard(optimizer, long_rollout_cfg):
         return new_params, new_opt_state, loss
     return train_step_standard
 
-# ================== DATASET ==================
+# ================== DATASET & BATCHING ==================
 
-def make_hamiltonian_dataset(key, n_trajectories=128, T=128):
+def make_hamiltonian_dataset(key, n_trajectories=256, T=128):
     X, Y = rollout_hamiltonian(key, n_trajectories=n_trajectories, T=T, dt=DT)
     return X, Y
 
-def make_batches(X, Y, batch_size=64):
+def make_batches(X, Y, batch_size=128):
     n = X.shape[0]
     n_batches = n // batch_size
     X = X[:n_batches * batch_size]
@@ -317,19 +346,19 @@ def rho_schedule(base_rho, curvature, ref=0.01, max_scale=5.0):
     scale = jnp.clip(scale, 0.5, max_scale)
     return float(base_rho * scale)
 
-# ================== TRAINING LOOP ==================
+# ================== TRAIN LOOP ==================
 
 def train(
     rng_key,
     epochs=5,
-    batch_size=64,
-    hidden_dim=128,
-    lora_rank=16,
+    batch_size=128,
+    hidden_dim=512,
+    lora_rank=32,
     base_lr=1e-3,
     use_sam=True,
 ):
     key_data, key_params, key_loop = random.split(rng_key, 3)
-    X, Y = make_hamiltonian_dataset(key_data, n_trajectories=128, T=128)
+    X, Y = make_hamiltonian_dataset(key_data, n_trajectories=256, T=128)
     in_dim = X.shape[-1]
 
     batches = make_batches(X, Y, batch_size=batch_size)
@@ -340,9 +369,9 @@ def train(
 
     long_rollout_cfg = {
         "enabled": True,
-        "horizon": 50,              # <-- lebih panjang
+        "horizon": 20,
         "teacher_forcing_ratio": 0.5,
-        "weight": 0.5,              # <-- lebih berat
+        "weight": 0.3,
     }
 
     train_step_sam = make_train_step_sam(optimizer, long_rollout_cfg)
@@ -439,25 +468,24 @@ def eval_long_rollout(params, key, horizon=200, n_trajectories=8):
         "E_model_mean": E_model_mean,
     }
 
-# ================== RUN TRAINING ==================
+# ================== RUN TRAINING & EVAL ==================
 
-key = random.PRNGKey(0)
-final_params, history = train(
-    key,
-    epochs=5,
-    batch_size=64,
-    hidden_dim=128,
-    lora_rank=16,
-    base_lr=1e-3,
-    use_sam=True,
-)
-print("History:", history)
+if __name__ == "__main__":
+    key = random.PRNGKey(0)
+    final_params, history = train(
+        key,
+        epochs=5,
+        batch_size=128,
+        hidden_dim=512,
+        lora_rank=32,
+        base_lr=1e-3,
+        use_sam=True,
+    )
+    print("History:", history)
 
-# ================== RUN EVALUATION ==================
-
-key_eval = random.PRNGKey(42)
-eval_res = eval_long_rollout(final_params, key_eval, horizon=200, n_trajectories=8)
-print("Final horizon MSE:", float(eval_res["mse_per_t"][-1]))
-print("Energy drift (true vs model, last step):",
-      float(eval_res["E_true_mean"][-1]),
-      float(eval_res["E_model_mean"][-1]))
+    key_eval = random.PRNGKey(42)
+    eval_res = eval_long_rollout(final_params, key_eval, horizon=200, n_trajectories=8)
+    print("Final horizon MSE:", float(eval_res["mse_per_t"][-1]))
+    print("Energy drift (true vs model, last step):",
+          float(eval_res["E_true_mean"][-1]),
+          float(eval_res["E_model_mean"][-1]))
